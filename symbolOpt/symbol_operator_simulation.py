@@ -302,5 +302,5 @@ if __name__ == "__main__":
     plt.title('多标准通信系统误码率性能（复用符号级算子）', fontsize=14)
     plt.grid(True, which='both', ls='--', alpha=0.7)
     plt.legend(fontsize=11)
-    plt.ylim(1e-6, 0.5)
+    # plt.ylim(1e-6, 0.5)
     plt.show()
