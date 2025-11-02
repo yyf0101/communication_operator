@@ -121,3 +121,72 @@ class SymbolLevelOperatorLibrary:
         dist1 = np.abs(symbol - constellation[1])**2
         llr[0] = (dist0 - dist1) / noise_variance
         return llr
+
+    # ---------------------- 1. 新增：4×4 MIMO信道生成算子 ----------------------
+    @staticmethod
+    def mimo_channel_generation(num_subcarriers: int, tx_ant: int = 4, rx_ant: int = 4) -> np.ndarray:
+        """
+        生成4×4 MIMO频域信道矩阵（瑞利衰落模型）
+        :param num_subcarriers: 子载波数量（与FFT点数一致）
+        :param tx_ant: 发射天线数（默认4）
+        :param rx_ant: 接收天线数（默认4）
+        :return: H: (num_subcarriers, rx_ant, tx_ant) 复数矩阵，每个子载波对应一个4×4信道
+        """
+        # 每个天线对的信道为独立复高斯分布（瑞利衰落，均值0、方差0.5+0.5j）
+        H = np.random.normal(0, np.sqrt(0.5), (num_subcarriers, rx_ant, tx_ant)) + \
+            1j * np.random.normal(0, np.sqrt(0.5), (num_subcarriers, rx_ant, tx_ant))
+        return H
+
+    # ---------------------- 2. 扩展：MIMO-LS信道估计（支持4×4矩阵） ----------------------
+    @staticmethod
+    def channel_estimation_ls_mimo(received_pilots: np.ndarray, known_pilots: np.ndarray) -> np.ndarray:
+        """
+        MIMO最小二乘（LS）信道估计，估计4×4信道矩阵
+        :param received_pilots: 接收导频矩阵 (rx_ant, pilot_num)，rx_ant=4，pilot_num=导频子载波数
+        :param known_pilots: 已知导频矩阵 (tx_ant, pilot_num)，tx_ant=4，每个发射天线用正交导频（如ZC序列）
+        :return: H_hat: (rx_ant, tx_ant) 估计的4×4信道矩阵
+        """
+        # LS估计公式：H_hat = Y * (X^H) * (X * X^H)^(-1)（避免X不可逆，加入正则化）
+        rx_ant, pilot_num = received_pilots.shape
+        tx_ant = known_pilots.shape[0]
+
+        # 计算X的伪逆：(X^H * X + εI)^(-1) * X^H，ε=1e-6防止奇异
+        X_H = np.conj(known_pilots.T)
+        X_XH = np.dot(known_pilots, X_H) + 1e-6 * np.eye(tx_ant)
+        X_pinv = np.dot(inv(X_XH), X_H)
+
+        # 估计4×4信道矩阵
+        H_hat = np.dot(received_pilots, X_pinv)
+        return H_hat
+
+    # ---------------------- 3. 扩展：QPSK-LLR计算（MIMO常用调制） ----------------------
+    @staticmethod
+    def llr_calculation_qpsk(symbol: np.ndarray, constellation: np.ndarray, noise_variance: float) -> np.ndarray:
+        """
+        QPSK调制符号的LLR计算（每个符号对应2个比特，b1b0：1+j→00，-1+j→01，-1-j→11，1-j→10）
+        :param symbol: 均衡后复符号 (N,)
+        :param constellation: QPSK星座图，默认np.array([1+1j, -1+1j, -1-1j, 1-1j])
+        :param noise_variance: 噪声方差（σ²）
+        :return: llr: (N, 2) 每个符号的2个比特LLR
+        """
+        N = len(symbol)
+        llr = np.zeros((N, 2))  # llr[:,0]对应b0，llr[:,1]对应b1
+
+        # 定义每个星座点对应的比特（b1b0）
+        bit_mapping = np.array([[0, 0], [0, 1], [1, 1], [1, 0]])
+
+        for i in range(N):
+            # 计算符号到4个星座点的欧氏距离平方
+            dist = np.abs(symbol[i] - constellation) ** 2
+
+            # 计算b0的LLR：ln(P(b0=0|r)/P(b0=1|r)) = (sum(dist[b0=1]) - sum(dist[b0=0])) / σ²
+            b0_0_dist = dist[bit_mapping[:, 0] == 0].sum()  # b0=0的距离和
+            b0_1_dist = dist[bit_mapping[:, 0] == 1].sum()  # b0=1的距离和
+            llr[i, 0] = (b0_1_dist - b0_0_dist) / noise_variance
+
+            # 计算b1的LLR：ln(P(b1=0|r)/P(b1=1|r))
+            b1_0_dist = dist[bit_mapping[:, 1] == 0].sum()  # b1=0的距离和
+            b1_1_dist = dist[bit_mapping[:, 1] == 1].sum()  # b1=1的距离和
+            llr[i, 1] = (b1_1_dist - b1_0_dist) / noise_variance
+
+        return llr
