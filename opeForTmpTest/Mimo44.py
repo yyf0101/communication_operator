@@ -55,14 +55,21 @@ class SymbolLevelOperatorLibrary:
     def mmse_equalization(received_symbols: np.ndarray, channel_matrix: np.ndarray, noise_variance: float) -> np.ndarray:
         H = channel_matrix  # rx_ant × tx_ant
         H_H = np.conj(H.T)  # tx_ant × rx_ant
-        I = np.eye(H.shape[1])  # 单位矩阵维度为发射天线数（tx_ant）
+        I = np.eye(H.shape[1])  # 单位矩阵维度为发射天线数
 
-        H_H_H = SymbolLevelOperatorLibrary.matrix_multiplication(H_H, H)  # tx_ant × tx_ant
+        H_H_H = SymbolLevelOperatorLibrary.matrix_multiplication(H_H, H)
+        # 降低正则项，减少信号抑制
         W = SymbolLevelOperatorLibrary.matrix_multiplication(
-            np.linalg.inv(H_H_H + noise_variance * I + 1e-3 * np.eye(H_H_H.shape[0])),
+            np.linalg.inv(H_H_H + noise_variance * I + 1e-6 * np.eye(H_H_H.shape[0])),
             H_H
         )
-        return SymbolLevelOperatorLibrary.matrix_multiplication(W, received_symbols.reshape(-1, 1))
+        equalized = SymbolLevelOperatorLibrary.matrix_multiplication(W, received_symbols.reshape(-1, 1))
+
+        # 能量归一化，匹配发送端符号能量
+        tx_energy = np.mean(np.abs(equalized)**2)
+        if tx_energy > 1e-6:
+            equalized *= (np.sqrt(2) / np.sqrt(tx_energy))  # 目标能量对应QPSK×2的幅度(~1.414)
+        return equalized
 
     @staticmethod
     def llr_calculation_qpsk(symbol: np.ndarray, constellation: np.ndarray, noise_variance: float) -> np.ndarray:
@@ -85,7 +92,7 @@ class SymbolLevelOperatorLibrary:
     def mimo_channel_generation(num_subcarriers: int, tx_ant: int = 4, rx_ant: int = 4) -> np.ndarray:
         H = np.random.normal(0, np.sqrt(0.5), (num_subcarriers, rx_ant, tx_ant)) + \
             1j * np.random.normal(0, np.sqrt(0.5), (num_subcarriers, rx_ant, tx_ant))
-        return H / np.sqrt(tx_ant)
+        return H / np.sqrt(tx_ant)  # 归一化信道能量
 
     @staticmethod
     def channel_estimation_ls_mimo(received_pilots: np.ndarray, known_pilots: np.ndarray) -> np.ndarray:
@@ -109,7 +116,7 @@ sym_length = fft_size + cp_length  # 1152点
 subcarrier_spacing = 15e3
 pilot_interval = 16
 num_symbols = 100
-num_sync_symbols = 2  # 专用同步符号数量
+num_sync_symbols = 4  # 同步符号重复4次
 num_symbols_tx = num_sync_symbols + num_symbols + 2  # 同步+数据+冗余
 qpsk_const = np.array([1+1j, -1+1j, -1-1j, 1-1j]) / np.sqrt(2)
 snr_db = 15
@@ -123,22 +130,23 @@ interp_positions = np.linspace(0, num_pilots-1, len(data_pos))
 # 发送端处理
 def tx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary):
     # 生成发送比特
-    num_bits_per_ant = (num_symbols_tx - num_sync_symbols) * num_data_per_symbol * 2  # 扣除同步符号
+    num_bits_per_ant = (num_symbols_tx - num_sync_symbols) * num_data_per_symbol * 2
     tx_bits = [np.random.randint(0, 2, num_bits_per_ant) for _ in range(tx_ant)]
     tx_bits_valid = [bits[:num_symbols * num_data_per_symbol * 2] for bits in tx_bits]
 
-    # 生成QPSK符号（降低幅度，×2）
+    # 生成QPSK符号（幅度×2）
     tx_symbols_list = []
     for ant in range(tx_ant):
         bits = tx_bits[ant]
         symbol_idx = bits.reshape(-1, 2) @ [2, 1]
-        tx_symbols = qpsk_const[symbol_idx] * 2  # 降低幅度，控制功率
+        tx_symbols = qpsk_const[symbol_idx] * 2  # 数据符号幅度
         tx_symbols_list.append(tx_symbols)
 
     # 构造频域数据符号（数据+导频）
     tx_freq_sym = np.zeros(((num_symbols_tx - num_sync_symbols), fft_size, tx_ant), dtype=np.complex128)
     for ant in range(tx_ant):
-        zc_pilot = operator_lib.generate_zc_sequence(num_pilots, root=3+ant*2) * 2  # 导频幅度同步降低
+        # 导频：正交根序列+功率提升（×3）
+        zc_pilot = operator_lib.generate_zc_sequence(num_pilots, root=23+ant*5) * 3
         for sym in range(num_symbols_tx - num_sync_symbols):
             tx_freq_sym[sym, data_pos, ant] = tx_symbols_list[ant][sym*num_data_per_symbol : (sym+1)*num_data_per_symbol]
             tx_freq_sym[sym, pilot_pos, ant] = zc_pilot
@@ -151,19 +159,20 @@ def tx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary):
             cp = ifft_out[-cp_length:]
             tx_time_sym[sym, :, ant] = np.hstack([cp, ifft_out])
 
-    # 生成专用同步符号（ZC序列，长度=sym_length）
+    # 生成专用同步符号（质数根ZC序列，重复4次）
     sync_seq_length = sym_length
-    sync_zc = [operator_lib.generate_zc_sequence(sync_seq_length, root=10+ant) for ant in range(tx_ant)]
-    sync_symbols = [seq * 2 for seq in sync_zc]  # 同步符号幅度
+    sync_root = [11, 13, 17, 19]  # 高自相关性质数根
+    sync_zc = [operator_lib.generate_zc_sequence(sync_seq_length, root=sync_root[ant]) for ant in range(tx_ant)]
+    sync_symbols = [seq * 3 for seq in sync_zc]  # 同步符号功率提升
 
     # 组合所有符号（同步符号+数据符号）
     tx_time_combined = np.zeros((num_symbols_tx * sym_length, tx_ant), dtype=np.complex128)
-    # 填充同步符号
+    # 填充同步符号（重复4次）
     for ant in range(tx_ant):
         for sym in range(num_sync_symbols):
             start_idx = sym * sym_length
             tx_time_combined[start_idx:start_idx+sym_length, ant] = sync_symbols[ant]
-    # 填充数据符号（偏移同步符号长度）
+    # 填充数据符号
     data_start = num_sync_symbols * sym_length
     for ant in range(tx_ant):
         for sym in range(num_symbols_tx - num_sync_symbols):
@@ -180,7 +189,7 @@ def tx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary):
     return tx_bits_valid, tx_symbols_list, tx_time_combined
 
 
-# 信道传输（不变）
+# 信道传输
 def mimo_channel_transmit(operator_lib: SymbolLevelOperatorLibrary, tx_time_combined: np.ndarray, snr_db: float):
     h_mimo_freq = operator_lib.mimo_channel_generation(fft_size, tx_ant, rx_ant)
     rx_time_combined = np.zeros((len(tx_time_combined), rx_ant), dtype=np.complex128)
@@ -222,11 +231,11 @@ def mimo_channel_transmit(operator_lib: SymbolLevelOperatorLibrary, tx_time_comb
     return rx_signal, h_mimo_freq, noise_power
 
 
-# 接收端处理（优化同步）
+# 接收端处理
 def rx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary, rx_time_combined: np.ndarray,
                    h_mimo_freq: np.ndarray, noise_var: float, tx_symbols_list: list):
-    # 1. 数字前端
-    fir_coeff = firwin(numtaps=15, cutoff=subcarrier_spacing*0.95, fs=fft_size*subcarrier_spacing)  # 简化滤波器
+    # 1. 数字前端：低阶滤波器，减少信号衰减
+    fir_coeff = firwin(numtaps=15, cutoff=subcarrier_spacing*0.98, fs=fft_size*subcarrier_spacing)
     iq_matrix = np.array([[1.0, -0.01], [0.01, 1.0]])
     rx_dfe_combined = np.zeros_like(rx_time_combined)
 
@@ -237,54 +246,60 @@ def rx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary, rx_time_combined: n
     rx_power = np.mean(np.abs(rx_dfe_combined)**2)
     print(f"[接收端] 数字前端处理完成，信号功率: {rx_power:.4f}, 范围: [{np.min(np.abs(rx_dfe_combined)):.3f}, {np.max(np.abs(rx_dfe_combined)):.3f}]")
 
-    # 2. 同步（基于专用同步符号）
+    # 2. 同步：累加4次同步符号相关性
     sync_seq_length = sym_length
-    local_sync = [operator_lib.generate_zc_sequence(sync_seq_length, root=10+ant) * 2 for ant in range(rx_ant)]  # 本地同步序列
+    sync_root = [11, 13, 17, 19]  # 与发送端一致
+    local_sync = [operator_lib.generate_zc_sequence(sync_seq_length, root=sync_root[rx]) * 3 for rx in range(rx_ant)]
     sync_offset = np.zeros(rx_ant, dtype=int)
-    max_sync_offset = sym_length  # 搜索范围：1个符号长度
-    min_sync_offset = 0
+    max_sync_offset = sym_length
 
     for rx in range(rx_ant):
-        sync_search_range = rx_dfe_combined[:(num_sync_symbols + 2)*sym_length, rx]  # 搜索前N个符号
+        sync_search_range = rx_dfe_combined[:8*sym_length, rx]  # 搜索前8个符号
         corr_vals = []
-        valid_offsets = range(min_sync_offset, max_sync_offset + 1)
-        local_seq = local_sync[rx]
+        valid_offsets = range(0, max_sync_offset)
 
         for offset in valid_offsets:
-            if offset + sync_seq_length > len(sync_search_range):
+            total_corr = 0
+            count = 0
+            # 累加4次同步符号的相关性
+            for rep in range(num_sync_symbols):
+                start = offset + rep * sym_length
+                end = start + sync_seq_length
+                if end > len(sync_search_range):
+                    break
+                rx_segment = sync_search_range[start:end]
+                corr = np.abs(np.sum(rx_segment * np.conj(local_sync[rx])))
+                corr /= (np.linalg.norm(rx_segment) * np.linalg.norm(local_sync[rx]) + 1e-12)
+                total_corr += corr
+                count += 1
+            if count > 0:
+                corr_vals.append(total_corr / count)  # 平均相关值
+            else:
                 corr_vals.append(0)
-                continue
-            rx_segment = sync_search_range[offset:offset+sync_seq_length]
-            # 归一化相关性
-            corr = np.abs(np.sum(rx_segment * np.conj(local_seq)))
-            corr /= (np.linalg.norm(rx_segment) * np.linalg.norm(local_seq) + 1e-12)
-            corr_vals.append(corr)
 
-        peak_idx = operator_lib.peak_detection(np.array(corr_vals), threshold=0.3)
+        peak_idx = operator_lib.peak_detection(np.array(corr_vals), threshold=0.2)
         sync_offset[rx] = valid_offsets[peak_idx]
 
-    final_sync_offset = int(np.median(sync_offset))  # 取中值更稳健
+    final_sync_offset = int(np.median(sync_offset))
     sync_quality = np.max(corr_vals) / np.mean(corr_vals) if np.mean(corr_vals) > 0 else 0
     print(f"[同步] 偏移: {final_sync_offset}, 相关性峰值/均值: {sync_quality:.1f} (正常应>5)")
-    data_start = final_sync_offset + num_sync_symbols * sym_length  # 数据符号起始位置（跳过同步符号）
+    data_start = final_sync_offset + num_sync_symbols * sym_length
     assert data_start + num_symbols * sym_length <= len(rx_dfe_combined), "同步偏移过大"
 
-    # 3. OFDM解调（从数据符号起始位置开始）
+    # 3. OFDM解调
     rx_freq = np.zeros((num_symbols, fft_size, rx_ant), dtype=np.complex128)
     for rx in range(rx_ant):
         for sym in range(num_symbols):
             sym_start = data_start + sym * sym_length
             sym_end = sym_start + sym_length
             sym_samp = rx_dfe_combined[sym_start + cp_length : sym_start + sym_length, rx]
-            if len(sym_samp) != fft_size:
-                raise ValueError(f"符号{sym}长度错误: {len(sym_samp)}点")
             rx_freq[sym, :, rx] = operator_lib.fft_operation(sym_samp) / fft_size
 
-    # 4. MIMO信道估计（不变）
+    # 4. MIMO信道估计
     h_est_full = np.zeros((num_symbols, fft_size, rx_ant, tx_ant), dtype=np.complex128)
     for sym in range(num_symbols):
         rx_pilot = rx_freq[sym, pilot_pos, :].T
-        known_pilot = np.array([operator_lib.generate_zc_sequence(num_pilots, root=3+ant*2) * 2 for ant in range(tx_ant)])
+        known_pilot = np.array([operator_lib.generate_zc_sequence(num_pilots, root=23+ant*5) * 3 for ant in range(tx_ant)])
         h_pilot = operator_lib.channel_estimation_ls_mimo(rx_pilot, known_pilot)
 
         for rx in range(rx_ant):
@@ -300,7 +315,7 @@ def rx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary, rx_time_combined: n
             mse_pilot = np.mean(np.abs(h_true_pilot - h_est_pilot)**2)
             print(f"[信道估计] 导频位置MSE: {mse_pilot:.6f} (越小越好)")
 
-    # 5. MMSE均衡（不变）
+    # 5. MMSE均衡（已修正）
     rx_data_sym = np.zeros((num_symbols, num_data_per_symbol, tx_ant), dtype=np.complex128)
     for sym in range(num_symbols):
         for i, data_idx in enumerate(data_pos):
@@ -317,7 +332,7 @@ def rx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary, rx_time_combined: n
             print(f"[均衡] 发送符号前5个: {np.round(tx_sym_0[:5], 3)}")
             print(f"[均衡] 均衡后前5个: {np.round(rx_sym_0[:5], 3)}")
 
-    # 6. LLR计算与比特恢复（不变）
+    # 6. LLR计算与比特恢复
     rx_bits = [[] for _ in range(tx_ant)]
     for sym in range(num_symbols):
         for i in range(num_data_per_symbol):
@@ -336,7 +351,7 @@ def rx_mimo_signal(operator_lib: SymbolLevelOperatorLibrary, rx_time_combined: n
     return rx_bits
 
 
-# BER计算（不变）
+# BER计算
 def calculate_ber(tx_bits: list, rx_bits: list) -> float:
     total_err = 0
     total_bits = 0
@@ -352,7 +367,7 @@ def calculate_ber(tx_bits: list, rx_bits: list) -> float:
     return total_err / total_bits if total_bits > 0 else 1.0
 
 
-# 主函数（不变）
+# 主函数
 if __name__ == "__main__":
     op_lib = SymbolLevelOperatorLibrary()
 
